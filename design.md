@@ -4,7 +4,7 @@
 
 PANTHEON is a code and runtime security platform composed of two operating divisions — **ARES** (offensive, perimeter interception) and **ARGUS** (defensive, continuous background surveillance) — unified under a shared Control Plane, EventLog, EventBus, SDK, and Policy layer.
 
-ARES intercepts Payloads at the perimeter using a sequential four-agent CrewAI pipeline: Parser → Static Scanner → Red Teamer → Auditor. ARGUS monitors assets continuously using OS-level file system events, a three-layer filter, and HVP-aware threat enrichment.
+ARES intercepts Payloads at the perimeter using a sequential four-agent CrewAI Pipeline: Parser → Scanner → RedTeamer → Auditor. ARGUS monitors assets continuously using OS-level file system events, a three-layer filter, and HVP-aware threat enrichment.
 
 The shared infrastructure provides a FastAPI-based Control Plane with real-time WebSocket delivery, RBAC-enforced session management, forensic evidence preservation, and a SIEM-compatible append-only EventLog.
 
@@ -28,10 +28,10 @@ The shared infrastructure provides a FastAPI-based Control Plane with real-time 
 │  │  Inspector               │    │     ▼                                │ │
 │  │  ┌──────────────────┐    │    │  ScanQueue (asyncio.Queue, bounded)  │ │
 │  │  │ Parser Agent     │    │    │     │                                │ │
-│  │  │ Static Scanner   │    │    │  Worker Pool (3 async workers)       │ │
+│  │  │ Scanner Agent    │    │    │  Worker Pool (3 async workers)       │ │
 │  │  │   Semgrep        │    │    │  ┌───────────────────────────┐       │ │
 │  │  │   Joern+GNN      │    │    │  │ Layer 1: Extension Filter │       │ │
-│  │  │ Red Teamer Agent │    │    │  │ Layer 2: SHA-256 Hash Gate│       │ │
+│  │  │ RedTeamer Agent  │    │    │  │ Layer 2: SHA-256 Hash Gate│       │ │
 │  │  │   ChromaDB RAG   │    │    │  │ Layer 3: AST/Regex Filter │       │ │
 │  │  │   Sandbox DAST   │    │    │  └───────────────────────────┘       │ │
 │  │  │ Auditor Agent    │    │    │     │ CodeChunk                      │ │
@@ -85,12 +85,12 @@ The shared infrastructure provides a FastAPI-based Control Plane with real-time 
 - Owns the post-audit hook: writes EventLog entry + publishes to EventBus atomically in the same async context.
 - Enforces the 30-second pipeline timeout for Payloads up to 1 MB.
 
-#### Parser Agent (CrewAI Agent)
+#### Parser Agent (CrewAI Pipeline — agent 1 of 4)
 
 - Normalizes encoding (UTF-8), detects language, extracts structured AST representation.
 - Outputs a `ParsedArtifact`: `{language, ast_json, normalized_text, metadata}`.
 
-#### Static Scanner Agent (CrewAI Agent)
+#### Scanner Agent (CrewAI Pipeline — agent 2 of 4)
 
 - Runs Semgrep via subprocess with configured rule sets (local path or registry ID).
 - Invokes Joern via subprocess to generate CPG; passes node/edge embeddings to the GNN inference component.
@@ -98,14 +98,14 @@ The shared infrastructure provides a FastAPI-based Control Plane with real-time 
 - On Semgrep non-zero exit: logs `EventLog` entry, sets `scan_status=inconclusive`, continues.
 - On Joern timeout (20 s): logs timeout, continues with Semgrep findings only.
 
-#### Red Teamer Agent (CrewAI Agent)
+#### RedTeamer Agent (CrewAI Pipeline — agent 3 of 4)
 
 - Queries ChromaDB with embedding derived from Payload characteristics; retrieves top-K docs (default K=5).
 - Calls Gemini API with retrieved docs + Payload summary.
 - If Payload is classified suspicious by static scan or RAG: spawns sandbox execution.
 - Outputs `RedTeamFindings`: `{rag_results, gemini_summary, sandbox_artifacts}`.
 
-#### Auditor Agent (CrewAI Agent)
+#### Auditor Agent (CrewAI Pipeline — agent 4 of 4)
 
 - Aggregates all prior findings.
 - Assigns final `Severity` (`low` / `medium` / `high` / `critical`).
@@ -165,19 +165,25 @@ See dedicated section below.
 - Query `HashDB` (SQLite); forward only functions with a changed hash.
 - All hashes unchanged → discard entire event.
 
-**Layer 3 — AST/Regex Criticality Filter**
+**Layer 3 — AST/Regex Criticality & Heuristic Keyword Density Filter**
 
 - Extract functions matching: auth patterns, crypto ops, DB queries, `eval`/`exec`/`subprocess`, network calls.
-- No critical patterns → discard.
+- Apply **Sliding Window Tokenizer**: 10 continuous lines window, density threshold > 2 tokens (`eval`, `exec`, `b64decode`, `subprocess`, `getattr`, `setattr`, `compile`, `__import__`, `base64`, `system`).
+- If density threshold > 2, flag as `suspicious_low_entropy_paywall` and promote to `CodeChunk` for AI analysis regardless of Shannon entropy score.
+- No critical patterns or density triggers → discard.
 - Matching functions promoted to `CodeChunk` objects.
 
 #### HVP Contextual Validator
 
 - After Auditor produces `ThreatReport`, lookup `HVP_Profile` by role (git author email hash → path match → UNKNOWN).
-- Apply `priority_multiplier` to base signal score.
-- Apply 20-point confidence boost (capped at 100) if threat vector matches profile.
-- Route escalation via configured channels (SMS / Slack / email / Control Plane) if final score ≥ `auto_escalation_threshold`.
+- Apply `priority_multiplier` to the CVSSv3 base score (cap 10.0).
+- Apply 2.0-point CVSSv3 confidence boost (cap 10.0) if threat vector matches profile.
+- Route escalation via configured channels if final score ≥ `auto_escalation_threshold` (≥ 9.0).
 - Special rules: `HRD_RECRUITMENT` → always route to sandbox regardless of Layer 3; `HVP_CALENDAR` → enable OSINT enrichment (attendee domain analysis).
+- **ICS Bypass Gateway**: `.ics` branch at Layer 1; routes calendar assets to the
+  dedicated ICS parser (`sdk/ics_parser.py`), skipping the token-length gate and
+  Layers 2–3. Emits `CodeChunk(match_reason="ics_anomaly"|"ics_clean")` with
+  `initial_context_score` for HVP_CALENDAR OSINT enrichment.
 
 ---
 
@@ -247,12 +253,12 @@ Inspector
   ├── Parser Agent
   │     normalize encoding → extract AST → ParsedArtifact
   │
-  ├── Static Scanner Agent
+  ├── Scanner Agent
   │     Semgrep(artifact) → Signals[]
   │     Joern(artifact) → CPG → GNN → anomaly_score → Signal?
   │     → ScanResult
   │
-  ├── Red Teamer Agent
+  ├── RedTeamer Agent
   │     embed query → ChromaDB(top-K docs)
   │     Gemini(docs + summary) → threat_summary
   │     suspicious? → Sandbox(payload) → artifacts
@@ -308,10 +314,10 @@ Worker (one of 3 async workers)
   │     git commit author email SHA-256 → path match → UNKNOWN
   │     → lookup HVP_Profile
   │
-  ├── Inspector (CrewAI pipeline — shared with ARES)
-  │     SentryAgent (fast triage) → skip if not suspicious
-  │     TrafficCodeAnalyzer (deep analysis: Semgrep + RAG + sandbox)
-  │     Auditor Agent → ThreatReport
+  ├── Inspector (CrewAI Pipeline — shared with ARES)
+  │     Sentry Gateway (pure-Python triage) → skip if not suspicious
+  │     CrewAI Pipeline: Parser → Scanner → RedTeamer → Auditor
+  │     → ThreatReport
   │
   ├── HVP Contextual Validator
   │     apply priority_multiplier, confidence boost, escalation routing
@@ -340,8 +346,9 @@ Control Plane HTTP endpoint
   │── return {job_id, status: "queued"} within 50ms
   │
   ▼
-Server-side Worker Pool (asyncio.Semaphore(3))
-  │── run_in_executor → SentryAgent → TrafficCodeAnalyzer → Auditor
+Pipeline Worker Pool (asyncio.Semaphore(3))
+  │── Sentry Gateway triage → suspicious? → run_in_executor → CrewAI Pipeline
+  │     (Parser → Scanner → RedTeamer → Auditor)
   │── post-audit hook → EventLog + EventBus
 ```
 
@@ -387,16 +394,22 @@ Excluded extensions (non-code files):
 
 Logic: Check both folder path AND extension before any further processing. If either matches the exclusion list, discard immediately.
 
-#### Length Boundary Tokenizer
+#### Length Boundary Tokenizer & Shannon Entropy Calculator
 
-Objective: Minimize CPU usage by filtering trivial tokens before deeper analysis.
+Objective: Minimize CPU usage by filtering trivial tokens before deeper analysis, and flag high-entropy secret payloads.
 
 Rules:
 
 - Tokenize file content into single string tokens (split on whitespace).
 - Only tokens with continuous character length > 60 (no spaces) proceed to further analysis.
 - Tokens ≤ 60 characters are passed through (ignored/cleared) immediately.
-- Rationale: Meaningful secrets, encoded payloads, and long identifiers exceed 60 chars. Short tokens (variable names, keywords) are not worth analyzing.
+- **Shannon Entropy Calculation (Ambiguitas 9 resolved):** For any token exceeding 60 characters, calculate Shannon Entropy $H = -\sum p(x) \log_2 p(x)$ in pure Python (using `math` and `collections.Counter`). If $H > 5.2$, assign a high risk-weight parameter (`high_entropy_secret_detected=True`) to the metadata packet, prioritizing the chunk for CrewAI Pipeline analysis.
+- Rationale: Meaningful secrets, encoded payloads, and long high-entropy identifiers exceed 60 chars and $H > 5.2$. Short tokens (variable names, keywords) are not worth analyzing.
+- **ICS Bypass Gateway (Ambiguitas 6 resolved):** calendar assets (`.ics`) are text
+  payloads with no code-execution properties, so they always fail the >60 gate yet
+  remain a critical phishing vector. If the extension is `.ics`, Layer 1 routes to
+  the dedicated ICS parser instead of the tokenizer — the length rule is skipped
+  entirely.
 
 #### Logic Flow
 
@@ -405,15 +418,139 @@ FileSystemEvent (watchdog)
     ↓
 [Folder Exclusion Check]   → excluded? → discard, log skip
     ↓
-[Extension Filter]         → non-code? → discard, log skip
-    ↓
+[Extension Filter]
+    ├── .ics? → ICS Bypass Gateway → ICS parser (SUMMARY/DESCRIPTION/URL/ORGANIZER)
+    │             → External Anomaly Flag? → elevate context score → CodeChunk
+    └── non-code? → discard, log skip
+    ↓ (code path only)
 [Read file content]
     ↓
-[Length Boundary Tokenizer]
+[Length Boundary Tokenizer & Shannon Entropy Calculator]
     tokenize → split on whitespace
-    filter: keep only tokens where len(token) > 60
+    filter: keep tokens where len(token) > 60
+    entropy evaluation: compute H = -sum(p * log2(p))
+    H > 5.2? → attach high_entropy_secret_detected=True
     ↓
-[Pass filtered tokens to Layer 2 (SHA-256 Hash Gate)]
+[Pass filtered tokens & entropy metadata to Layer 2 (SHA-256 Hash Gate)]
+```
+
+#### ICS Parser Module (`sdk/ics_parser.py`)
+
+##### Objective
+
+Inspect text-based calendar metadata for phishing indicators without executing
+anything. Pure stdlib, no external ICS library.
+
+**Validates: Requirements 9.8**
+
+##### Logic Flow
+
+```
+.ics content
+    ↓
+[unfold lines] (RFC 5545: continuation lines start with space/tab → join)
+    ↓
+[extract per-VEVENT] SUMMARY, DESCRIPTION, URL, ORGANIZER (+ATTENDEE list)
+    ↓
+[anomaly checks]
+    URL field with non-https scheme, punycode/IDN, IP host, or @-trick
+      → External Anomaly Flag + context +1.5
+    ORGANIZER/ATTENDEE domain ∉ trusted_domains → flag + context +1.0
+    DESCRIPTION containing URL whose display text host ≠ link host
+      → flag + context +2.0
+    ↓
+CodeChunk(match_reason="ics_anomaly" | "ics_clean",
+          initial_context_score=elevated | 0.0) → HVP enrichment (HVP_CALENDAR OSINT)
+```
+
+##### Input/Output Schema
+
+```
+Input:  content: str (raw .ics), trusted_domains: list[str]
+Output: ICSParseResult(external_anomaly: bool, flags: list[str],
+        initial_context_score: float, fields: {summary, description, urls, organizer})
+skip_reason baru: "ics_clean" (parsed, no anomaly — still forwarded with score 0.0,
+  HVP_CALENDAR OSINT decides) — never "no_tokens_above_threshold" for .ics
+```
+
+##### Core Code Snippet
+
+```python
+# sdk/ics_parser.py — stdlib only, no code execution
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass, field
+from urllib.parse import urlparse
+
+_URL_RE = re.compile(r"https?://[^\s<>\"]+", re.IGNORECASE)
+
+
+@dataclass
+class ICSParseResult:
+    external_anomaly: bool = False
+    flags: list[str] = field(default_factory=list)
+    initial_context_score: float = 0.0
+    fields: dict = field(default_factory=dict)
+
+
+def _unfold(content: str) -> list[str]:
+    """RFC 5545 line unfolding: space/tab-prefixed lines continue the previous."""
+    lines: list[str] = []
+    for raw in content.splitlines():
+        if raw[:1] in (" ", "\t") and lines:
+            lines[-1] += raw[1:]
+        else:
+            lines.append(raw)
+    return lines
+
+
+def _field(lines: list[str], name: str) -> list[str]:
+    prefix = name.upper() + ":"
+    alt = name.upper() + ";"
+    return [ln.split(":", 1)[1] for ln in lines
+            if ln.upper().startswith(prefix) or ln.upper().startswith(alt)]
+
+
+def _url_anomalies(url: str) -> list[str]:
+    out: list[str] = []
+    try:
+        host = urlparse(url).hostname or ""
+    except ValueError:
+        return ["malformed_url"]
+    if urlparse(url).scheme != "https":
+        out.append("non_https_url")
+    if host.replace(".", "").isdigit() or ":" in host:
+        out.append("ip_host_url")
+    if "xn--" in host or "@" in url.split("/")[2] if "/" in url else "@" in url:
+        out.append("deceptive_url")
+    return out
+
+
+def parse_ics(content: str, trusted_domains: list[str] | None = None) -> ICSParseResult:
+    """Parse calendar metadata; flag external anomalies. Never executes content."""
+    trusted = {d.lower() for d in (trusted_domains or [])}
+    res = ICSParseResult()
+    lines = _unfold(content)
+    summaries = _field(lines, "SUMMARY")
+    descriptions = _field(lines, "DESCRIPTION")
+    urls = _field(lines, "URL") + [u for d in descriptions for u in _URL_RE.findall(d)]
+    organizers = _field(lines, "ORGANIZER")
+    res.fields = {"summary": summaries, "description": descriptions,
+                  "urls": urls, "organizer": organizers}
+    for url in urls:
+        for flag in _url_anomalies(url):
+            res.flags.append(f"url:{flag}:{url[:64]}")
+    for org in organizers:
+        m = re.search(r"mailto:([^@\s]+)@([^\s;>]+)", org, re.IGNORECASE)
+        if m and m.group(2).lower() not in trusted:
+            res.flags.append(f"organizer:untrusted_domain:{m.group(2)[:64]}")
+    boost = sum(1.5 if f.startswith("url:") else 1.0 for f in res.flags)
+    # ponytail: bobot flag statis; kalibrasi dari data phishing nyata bila tersedia
+    if res.flags:
+        res.external_anomaly = True
+        res.initial_context_score = round(min(boost, 10.0), 1)
+    return res
 ```
 
 #### Input/Output Schema
@@ -446,6 +583,32 @@ EXCLUDED_EXTENSIONS: frozenset[str] = frozenset({
 })
 
 MIN_TOKEN_LENGTH: int = 60
+SHANNON_ENTROPY_THRESHOLD: float = 5.2  # H > 5.2 triggers high risk weight (Req 9.9)
+
+# ── Shannon Entropy Helper ───────────────────────────────────────────────────
+
+import math
+from collections import Counter
+
+
+def calculate_shannon_entropy(token: str) -> float:
+    """Pure-Python Shannon Entropy calculator: H = -sum(p * log2(p))."""
+    if not token:
+        return 0.0
+    length = len(token)
+    counts = Counter(token)
+    return -sum((count / length) * math.log2(count / length) for count in counts.values())
+
+
+def _has_long_tokens(content: str) -> bool:
+    """Evaluates tokens > 60 chars. Returns True if any exists."""
+    return any(len(tok) > MIN_TOKEN_LENGTH for tok in content.split())
+
+
+def _has_high_entropy_tokens(content: str) -> bool:
+    """Evaluates tokens > 60 chars. Returns True if any token has H > 5.2."""
+    tokens = [tok for tok in content.split() if len(tok) > MIN_TOKEN_LENGTH]
+    return any(calculate_shannon_entropy(tok) > SHANNON_ENTROPY_THRESHOLD for tok in tokens)
 
 @dataclass
 class FilterResult:
@@ -632,9 +795,9 @@ class EventLogEntry:
     asset_type: str             # "source_code" | "runtime_payload" | "calendar"
     asset_ext: str              # file extension (e.g. ".py")
     source_path_hash: str       # SHA-256(original_file_path)
-    severity_level: str         # "low" | "medium" | "high" | "critical"
-    base_score: float           # Auditor base score before multiplier
-    final_score: float          # base_score * hvp_multiplier (+ confidence boost)
+    severity_level: str         # from CVSSv3 final: 0.0-3.9 low, 4.0-6.9 medium, 7.0-8.9 high, 9.0-10.0 critical
+    base_score: float           # CVSSv3 0.0-10.0, Auditor score before multiplier
+    final_score: float          # CVSSv3 0.0-10.0 = min(base*hvp_multiplier + boost, 10.0)
     threat_detected: list[str]  # list of threat names
     matched_patterns: list[str] # Semgrep rule IDs or GNN pattern names
     detection_source: str       # "perimeter" | "background"
@@ -748,7 +911,7 @@ class HVP_Profile:
     threat_vectors: list[str]
     monitored_assets: list[str]         # file path patterns or asset identifiers
     escalation_channels: list[str]      # "sms" | "email" | "slack" | "control_plane"
-    auto_escalation_threshold: float    # final score threshold for immediate escalation
+    auto_escalation_threshold: float    # CVSSv3 0.0-10.0, hardcoded >= 9.0
     email_patterns: list[str]           # regex patterns for git author email matching
     path_patterns: list[str]            # glob patterns for file path matching
 ```
@@ -900,7 +1063,7 @@ _For any_ malformed or missing `Policy` input, the SDK raises `ConfigurationErro
 
 ### Property 3: Pipeline agent invocation order is always preserved
 
-_For any_ valid `Payload`, the `agent_chain` field in the resulting `ThreatReport` is always `["Parser", "StaticScanner", "RedTeamer", "Auditor"]` in that order, regardless of payload content or size.
+_For any_ valid `Payload`, the `agent_chain` field in the resulting `ThreatReport` is always `["Parser", "Scanner", "RedTeamer", "Auditor"]` in that order, regardless of payload content or size.
 
 **Validates: Requirements 2.1**
 
@@ -924,7 +1087,7 @@ _For any_ non-empty Semgrep result containing N rule matches, the `ScanResult` c
 
 ### Property 6: Semgrep non-zero exit produces inconclusive result without blocking pipeline
 
-_For any_ Semgrep subprocess that exits with a non-zero return code, the `ScanResult.scan_status` is `"inconclusive"`, an EventLog entry records the error, and the pipeline continues to the Red Teamer Agent.
+_For any_ Semgrep subprocess that exits with a non-zero return code, the `ScanResult.scan_status` is `"inconclusive"`, an EventLog entry records the error, and the pipeline continues to the RedTeamer Agent.
 
 **Validates: Requirements 3.5**
 
@@ -994,9 +1157,9 @@ _For any_ function body submitted to the hash gate that has already been process
 
 ---
 
-### Property 15: HVP final score equals base score multiplied by priority multiplier
+### Property 15: HVP final score is CVSSv3-capped and severity-mapped
 
-_For any_ `base_score` and `HVP_Profile.priority_multiplier`, the `final_score` recorded in the EventLog equals `base_score * priority_multiplier`, and if the detected threat vector matches the profile's `threat_vectors`, the final score is `min(final_score + 20, 100)`.
+_For any_ CVSSv3 `base_score` in [0.0, 10.0] and `HVP_Profile.priority_multiplier`, the `final_score` recorded in the EventLog equals `min(base_score * priority_multiplier + boost, 10.0)` where `boost` is 2.0 if the detected threat vector matches the profile's `threat_vectors` else 0.0; `severity_level` is then `low` for 0.0–3.9, `medium` for 4.0–6.9, `high` for 7.0–8.9, `critical` for 9.0–10.0.
 
 **Validates: Requirements 10.2, 10.3**
 
@@ -1299,8 +1462,14 @@ Apply all deterministic filtering stages in a single module before any LLM or CP
 ##### Logic Flow
 
 ```
-event_path (str)
+event_path (str) + asset_owner_role (str)
     ↓
+[HRD_RECRUITMENT Override Check]
+    asset_owner_role == "HRD_RECRUITMENT"?
+    → YES: Bypass L0/L1/L2/L3 penuh (cegah telemetry starvation / false-positive hash bomb)
+           baca file → CodeChunk(match_reason="force_sandbox_hrd")
+           → FilterResult(passed=True) → ForensicExtractor → HTTP POST ke Control Plane
+    ↓ NO
 [L0 — Folder Exclusion]
     path parts ∩ EXCLUDED_FOLDERS → discard (skip_reason: "excluded_folder")
     ↓
@@ -1333,7 +1502,8 @@ FilterResult(passed=True, chunks=[CodeChunk, ...])
 
 ```
 Input:
-    event_path: str    — absolute file path from watchdog event
+    event_path: str          — absolute file path from watchdog event
+    asset_owner_role: str    — resolved role (default: "UNKNOWN")
 
 Output:
     FilterResult
@@ -1346,14 +1516,14 @@ Output:
             "not_in_allowlist"
             "hash_unchanged"
             "no_critical_patterns"
-            None  (passed)
+            None  (passed, match_reason="force_sandbox_hrd" jika HRD)
 
 CodeChunk
     file_path_hash: str      — SHA-256(original_file_path)
-    function_name: str
-    source_text: str         — raw function body (deleted after ForensicExtractor)
-    match_reason: str        — Layer 3 matched pattern label
-    asset_owner_role: str    — resolved by HVP Validator (default: "UNKNOWN")
+    function_name: str       — "<document_raw>" untuk HRD_RECRUITMENT
+    source_text: str         — raw file content / function body (deleted after ForensicExtractor)
+    match_reason: str        — Layer 3 label atau "force_sandbox_hrd"
+    asset_owner_role: str    — resolved by HVP Validator
     client_id: str
 ```
 
@@ -1386,6 +1556,32 @@ EXCLUDED_EXTENSIONS: frozenset[str] = frozenset({
 })
 
 MIN_TOKEN_LENGTH: int = 60
+SHANNON_ENTROPY_THRESHOLD: float = 5.2  # H > 5.2 triggers high risk weight (Req 9.9)
+
+# ── Shannon Entropy Helper ───────────────────────────────────────────────────
+
+import math
+from collections import Counter
+
+
+def calculate_shannon_entropy(token: str) -> float:
+    """Pure-Python Shannon Entropy calculator: H = -sum(p * log2(p))."""
+    if not token:
+        return 0.0
+    length = len(token)
+    counts = Counter(token)
+    return -sum((count / length) * math.log2(count / length) for count in counts.values())
+
+
+def _has_long_tokens(content: str) -> bool:
+    """Evaluates tokens > 60 chars. Returns True if any exists."""
+    return any(len(tok) > MIN_TOKEN_LENGTH for tok in content.split())
+
+
+def _has_high_entropy_tokens(content: str) -> bool:
+    """Evaluates tokens > 60 chars. Returns True if any token has H > 5.2."""
+    tokens = [tok for tok in content.split() if len(tok) > MIN_TOKEN_LENGTH]
+    return any(calculate_shannon_entropy(tok) > SHANNON_ENTROPY_THRESHOLD for tok in tokens)
 
 # ── Layer 1 Constants ────────────────────────────────────────────────────────
 
@@ -1402,6 +1598,14 @@ CRITICAL_PATTERNS: list[tuple[str, str]] = [
     (r"(?i)(eval|exec|subprocess|os\.system|__import__)", "exec"),
     (r"(?i)(requests\.|urllib|httpx|aiohttp|socket\.)", "network"),
 ]
+
+# Sliding Window Tokenizer Constants (Ambiguitas 5 resolved)
+SLIDING_WINDOW_SIZE: int = 10  # continuous lines
+DENSITY_WEIGHT_THRESHOLD: int = 2  # tokens per window
+DENSITY_TOKENS: frozenset[str] = frozenset({
+    "eval", "exec", "b64decode", "subprocess", "getattr",
+    "setattr", "compile", "__import__", "base64", "system"
+})
 
 
 # ── Data Structures ──────────────────────────────────────────────────────────
@@ -1462,17 +1666,57 @@ def _extract_functions_python(source: str) -> list[tuple[str, str]]:
 
 # ── Layer 3 Helper ───────────────────────────────────────────────────────────
 
+def _check_keyword_density(source: str) -> bool:
+    """Sliding Window Tokenizer: hit jika akumulasi token sensitif > 2 dalam window 10 baris."""
+    lines = source.splitlines()
+    if len(lines) < 1:
+        return False
+    for i in range(len(lines)):
+        window_lines = lines[i : i + SLIDING_WINDOW_SIZE]
+        window_text = " ".join(window_lines)
+        tokens = re.findall(r"\b\w+\b", window_text.lower())
+        count = sum(1 for tok in tokens if tok in DENSITY_TOKENS)
+        if count > DENSITY_WEIGHT_THRESHOLD:
+            return True
+    return False
+
+
 def _match_critical(source: str) -> str | None:
-    """Return the first matched pattern label, or None."""
+    """Return the first matched pattern label, low-entropy paywall flag, or None."""
     for pattern, label in CRITICAL_PATTERNS:
         if re.search(pattern, source):
             return label
+    if _check_keyword_density(source):
+        return "suspicious_low_entropy_paywall"
     return None
 
 
 # ── Public Entry Point ───────────────────────────────────────────────────────
 
-def pre_filter(event_path: str, hashdb: HashDB | None = None) -> FilterResult:
+def pre_filter(
+    event_path: str,
+    hashdb: HashDB | None = None,
+    asset_owner_role: str = "UNKNOWN",
+) -> FilterResult:
+    # Force Sandbox Protocol for HRD_RECRUITMENT (Ambiguitas 7, Req 10.6):
+    # dokumen CV/Resume dari vektor rekrutmen eksternal rentan infostealer.
+    # Karena file selalu baru, Layer 2 (Hash Gate) & Layer 3 (AST Filter) di-bypass
+    # penuh untuk mencegah telemetry starvation dan false-positive hash bypass.
+    if asset_owner_role == "HRD_RECRUITMENT":
+        try:
+            content = Path(event_path).read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            return FilterResult(passed=False, skip_reason="read_error")
+        file_path_hash = hashlib.sha256(event_path.encode()).hexdigest()
+        chunk = CodeChunk(
+            file_path_hash=file_path_hash,
+            function_name="<document_raw>",
+            source_text=content,
+            match_reason="force_sandbox_hrd",
+            asset_owner_role="HRD_RECRUITMENT",
+        )
+        return FilterResult(passed=True, chunks=[chunk])
+
     # L0 — Folder exclusion
     if _is_excluded_path(event_path):
         return FilterResult(passed=False, skip_reason="excluded_folder")
@@ -1829,8 +2073,8 @@ class EventLogEntry:
     asset_ext: str
     source_path_hash: str
     severity_level: str
-    base_score: float
-    final_score: float
+    base_score: float   # CVSSv3 0.0-10.0
+    final_score: float  # CVSSv3 0.0-10.0
     threat_detected: list[str]
     matched_patterns: list[str]
     detection_source: str        # "perimeter" | "background"
@@ -1872,7 +2116,7 @@ class HVP_Profile:
     threat_vectors: list[str]
     monitored_assets: list[str]
     escalation_channels: list[str]
-    auto_escalation_threshold: float
+    auto_escalation_threshold: float = 9.0  # CVSSv3, hardcoded >= 9.0
     email_patterns: list[str]    # regex patterns for git author email
     path_patterns: list[str]     # glob patterns for file path matching
 ```
@@ -1928,7 +2172,7 @@ class HVPProfileConfig(BaseModel):
     threat_vectors: list[str] = Field(default_factory=list)
     monitored_assets: list[str] = Field(default_factory=list)
     escalation_channels: list[str] = Field(default_factory=list)
-    auto_escalation_threshold: float = Field(default=0.8, ge=0.0, le=1.0)
+    auto_escalation_threshold: float = Field(default=9.0, ge=9.0, le=10.0)
     email_patterns: list[str] = Field(default_factory=list)
     path_patterns: list[str] = Field(default_factory=list)
 
@@ -2015,7 +2259,12 @@ class Policy(BaseModel):
 
 ---
 
-### Part 3: Transport Submission and Control Plane Ingestion Layer
+### Part 3: FastAPI Ingestion & RBAC Core
+
+Consolidated: Part 3 absorbs all transport/submission, authentication, session, and
+access-control specs. The former Part 6 (RBAC, SessionToken, Data Masking) is folded
+here; the standalone Part 6 heading is removed. Canonical masking rules and RBAC
+matrix live in `## Security Design`; this Part holds the ingestion + enforcement code.
 
 #### Modules: `sdk/transport.py`, `control_plane/api/jobs.py`, `control_plane/rbac.py`
 
@@ -2220,6 +2469,12 @@ validate_api_key(Authorization header)    ← dependency injection
 parse SubmissionPayload (Pydantic)
     invalid → HTTP 422
     ↓
+[User Rate Limiting & Throttling Engine] (Req 15.10 — Anti Denial of Wallet)
+    check_user_rate(client_id / user_token) > USER_RPM_CEILING (default: 10 RPM)?
+    ├── YES: return HTTP 429 {"detail": "rate_limit_exceeded", "retry_after": 60}
+    │        place job into USER_SUSPENDED_QUEUE[client_id] (memory-bounded holding queue)
+    └── NO:  proceed
+    ↓
 SERVER_SCAN_QUEUE.full()?
     True  → HTTP 503 {"detail": "queue_full"}
     ↓
@@ -2259,8 +2514,25 @@ from shared.models import SubmissionPayload
 
 router = APIRouter(prefix="/api/v1", tags=["jobs"])
 
-# Server-side bounded queue — shared across all workers
+# Pipeline Worker queue — shared across all workers
 SERVER_SCAN_QUEUE: asyncio.Queue = asyncio.Queue(maxsize=5_000)
+
+# Per-User Throttling & Suspended Queue Engine (Ambiguitas 10, Req 15.10)
+USER_RPM_CEILING: int = 10  # max 10 RPM per user/device signature
+USER_TRANSACTIONS: dict[str, list[float]] = {}  # client_id -> timestamps
+USER_SUSPENDED_QUEUE: dict[str, asyncio.Queue] = {}  # client_id -> bounded holding queue
+
+
+def check_and_track_user_rate(client_id: str, limit: int = USER_RPM_CEILING) -> bool:
+    """Return True if under rate ceiling, False if burst threshold exceeded."""
+    now = datetime.now(timezone.utc).timestamp()
+    timestamps = USER_TRANSACTIONS.setdefault(client_id, [])
+    # purge timestamps older than 60s
+    USER_TRANSACTIONS[client_id] = [t for t in timestamps if now - t < 60.0]
+    if len(USER_TRANSACTIONS[client_id]) >= limit:
+        return False
+    USER_TRANSACTIONS[client_id].append(now)
+    return True
 
 
 def utcnow_iso() -> str:
@@ -2274,8 +2546,23 @@ async def receive_job(
 ) -> dict:
     """
     Accept a SubmissionPayload from the SDK.
-    Enqueues immediately; returns job_id within 50ms.
+    Enforces per-user rate ceiling (10 RPM); suspends overflow, returns 429 on burst.
     """
+    client_id = payload.client_id or payload.file_path_hash
+
+    if not check_and_track_user_rate(client_id):
+        # Throttle stream, place into memory-bounded suspended holding queue
+        holding_queue = USER_SUSPENDED_QUEUE.setdefault(client_id, asyncio.Queue(maxsize=100))
+        try:
+            holding_queue.put_nowait({"chunk": payload, "submitted_at": utcnow_iso()})
+        except asyncio.QueueFull:
+            pass  # bound memory, drop if holding queue full
+        raise HTTPException(
+            status_code=429,
+            detail="rate_limit_exceeded",
+            headers={"Retry-After": "60"},
+        )
+
     if SERVER_SCAN_QUEUE.full():
         raise HTTPException(status_code=503, detail="queue_full")
 
@@ -2284,10 +2571,9 @@ async def receive_job(
         "job_id": job_id,
         "chunk": payload,
         "submitted_at": utcnow_iso(),
-        "client_id": payload.client_id,
+        "client_id": client_id,
     }
 
-    # Non-blocking — if queue fills between .full() check and put, catch it
     try:
         SERVER_SCAN_QUEUE.put_nowait(job)
     except asyncio.QueueFull:
@@ -2519,30 +2805,898 @@ async def log_unauthorized_attempt(
 
 ---
 
-### Part 4: HVP Contextual Validator
+### Part 4: HVP IDENTITY & THREAT MATCHER WITH ANTI-SPOOFING
 
-> _Placeholder — to be specified in the next part._
-
----
-
-### Part 5: Control Plane — FastAPI Server and Worker Pool
-
-> _Placeholder — to be specified in the next part._
+#### Modules: `hvp/identity.py`, `hvp/matcher.py`
 
 ---
 
-### Part 6: RBAC, SessionToken, and Data Masking
+#### `hvp/identity.py` — GPG Validation
 
-> _Placeholder — to be specified in the next part._
+##### Objective
+
+Verifikasi identitas penulis commit via GPG signature (`git verify-commit`) sebelum HVP role resolution dipercaya. Commit pada aset Critical/High tanpa signature valid → `identity_spoofing_detected=True`, eskalasi ke SUPER_ADMIN apapun Severity routing aktif.
+
+**Validates: Requirements 10.13**
+
+##### Logic Flow
+
+```
+ForensicContext.git_commit_hash + resolved role (severity_weight CRITICAL/HIGH)
+    ↓
+subprocess: git verify-commit <hash> (timeout 5s)
+    ├── returncode 0 → valid → identity_spoofing_detected=False → lanjut normal
+    └── returncode != 0 / timeout / git hilang:
+          ├── stderr ∈ {"untrusted_key", "expired_key"} AND author_email_hash ∈ internal_employee_directory?
+          │     ├── YES: [Cryptographic Key Lifecycle Grace Period]
+          │     │        ├── Tahan status di MEDIUM (Pending Key Verification)
+          │     │        ├── Pasang flag "WARM LOCK" pada commit di EventLog
+          │     │        └── Terbitkan & kirim HMAC bootstrap token otomatis ke dev untuk self-remediation
+          │     └── NO:  → identity_spoofing_detected=True
+          │              → EventLog entry + threat_report.spoof_detail = {commit_hash, reason}
+          │              → eskalasi SUPER_ADMIN channel, bypass Severity routing
+role MEDIUM/LOW → skip verify, flag=False
+```
+
+##### Input/Output Schema
+
+```
+Input:  git_commit_hash: str | None, severity_weight: str,
+        author_email_hash: str | None = None,
+        employee_directory: EmployeeDirectory | None = None,
+        grace_hours: int = 72
+Output: IdentityVerdict(is_spoofed: bool, reason: str | None, detail: dict | None)
+        reason ∈ {"invalid_signature","untrusted_key","expired_key","no_signature",
+                  "git_unavailable","timeout","warm_lock", None}
+        warm_lock → tahan MEDIUM (Pending Key Verification) + WARM LOCK commit
+                     + bootstrap token di detail (Req 10.14-10.15)
+```
+
+##### Core Code Snippet
+
+```python
+# hvp/identity.py
+from __future__ import annotations
+
+import hashlib
+import hmac
+import secrets
+import subprocess
+import time
+from dataclasses import dataclass
+
+
+_BOOTSTRAP_KEY: bytes = secrets.token_bytes(32)  # in-memory only, rotasi tiap startup
+
+
+@dataclass
+class IdentityVerdict:
+    is_spoofed: bool
+    reason: str | None = None
+    # reason "warm_lock" -> Grace Period: tahan di MEDIUM (Pending Key
+    # Verification), commit di-WARM LOCK, bootstrap token diterbitkan
+    # (Req 10.14-10.15). reason kini mencakup "expired_key".
+    detail: dict | None = None
+
+
+_VERIFY_TIMEOUT_S = 5
+_GATED_WEIGHTS = frozenset({"CRITICAL", "HIGH"})
+_GRACE_HOURS_DEFAULT = 72  # Req 10.15
+
+
+def issue_bootstrap_token(author_email_hash: str, git_commit_hash: str,
+                          grace_hours: int = _GRACE_HOURS_DEFAULT) -> str:
+    """Terbitkan token bootstrap rotasi kunci (HMAC, single-use, kedaluwarsa).
+
+    Token dikirim ke pengembang untuk validasi mandiri; redeem dengan
+    kunci GPG baru dalam grace window menghapus WARM LOCK (Req 10.15).
+    """
+    payload = f"{author_email_hash}:{git_commit_hash}:{time.time() + grace_hours * 3600}"
+    return hmac.new(_BOOTSTRAP_KEY, payload.encode(), hashlib.sha256).hexdigest() + "." + payload
+
+
+def verify_commit_identity(
+    git_commit_hash: str | None,
+    severity_weight: str,
+    author_email_hash: str | None = None,
+    employee_directory: object | None = None,
+    grace_hours: int = 72,
+) -> IdentityVerdict:
+    """GPG-verify commit. Hanya role CRITICAL/HIGH yang digate.
+
+    Cryptographic Key Lifecycle Grace Period (Req 10.14-10.15):
+    untrusted/expired key + email dikenal di direktori internal
+    -> warm_lock, bukan alarm darurat; bootstrap token diterbitkan.
+    """
+    if severity_weight not in _GATED_WEIGHTS:
+        return IdentityVerdict(is_spoofed=False)
+    if not git_commit_hash:
+        return IdentityVerdict(is_spoofed=True, reason="no_signature")
+    try:
+        result = subprocess.run(
+            ["git", "verify-commit", git_commit_hash],
+            capture_output=True, text=True, timeout=_VERIFY_TIMEOUT_S,
+        )
+    except subprocess.TimeoutExpired:
+        return IdentityVerdict(is_spoofed=True, reason="timeout")
+    except (FileNotFoundError, OSError):
+        return IdentityVerdict(is_spoofed=True, reason="git_unavailable")
+    if result.returncode == 0:
+        return IdentityVerdict(is_spoofed=False)
+    stderr = (result.stderr or "").lower()
+    if "no signature" in stderr or "not signed" in stderr:
+        reason = "no_signature"
+    elif "expired" in stderr:
+        reason = "expired_key"
+    elif "can't check signature" in stderr or "no public key" in stderr:
+        reason = "untrusted_key"
+    else:
+        reason = "invalid_signature"
+    if reason in ("untrusted_key", "expired_key") and employee_directory is not None:
+        if author_email_hash and employee_directory.is_known(author_email_hash):
+            token = issue_bootstrap_token(author_email_hash, git_commit_hash, grace_hours)
+            return IdentityVerdict(is_spoofed=False, reason="warm_lock",
+                                   detail={"bootstrap_token": token,
+                                           "grace_hours": grace_hours})
+    return IdentityVerdict(is_spoofed=True, reason=reason)
+```
 
 ---
 
-### Part 7: EventLog, EventBus, and WebSocket Pipeline
+#### `hvp/matcher.py` — Threat Intelligence Multiplier
 
-> _Placeholder — to be specified in the next part._
+##### Objective
+
+Pencocokan kontekstual per role: multiplier skor + boost keyakinan + modul khusus (OSINT calendar, supply-chain Lead Dev, sandbox-paksa HRD).
+
+**Validates: Requirements 10.2–10.8, 10.10–10.12**
+
+##### Logic Flow
+
+```
+ThreatReport(base_score, threat_vector) + HVP_Profile + ForensicContext
+    ↓
+[1. Role resolution] email-hash git author → path pattern
+    → matched: apply HVP_Profile (multiplier + boost + routing)
+    → NO MATCH: UNKNOWN_HIGH_RISK (Zero Trust — Req 10.9)
+        base_score floor = 7.0 (high), force deep analysis,
+        EventLog identity_resolved=False, zero_trust_escalation=True
+    ↓
+[2. Score] final = min(base * priority_multiplier + (2.0 jika threat_vector cocok), 10.0)
+    → severity_from_score(final): 0.0-3.9 low, 4.0-6.9 medium, 7.0-8.9 high, 9.0-10.0 critical
+    ↓
+[3. Modul khusus per role]
+    CEO (Critical, 2.0x): langsung → SMS+email+CP jika ≥ threshold
+    LEAD_DEV (High, 1.5x): pola supply chain (registry/CI/manifest/secret repo)
+        → skor ×1.2 tambahan, cap 100
+    HVP_CALENDAR (Medium, 1.2x): OSINT — domain attendee ∉ trusted
+        + (umur <365h atau typosquat) → Signal medium
+    HRD_RECRUITMENT (Low, 1.0x): file eksternal → sandbox, abaikan Layer 3
+    ↓
+[4. Routing] final ≥ auto_escalation_threshold (≥ 9.0) → containment + channel profil
+    UNKNOWN_HIGH_RISK → base_score floor 7.0 → full CrewAI Pipeline (no skip)
+```
+
+##### Input/Output Schema
+
+```
+Input:  base_score: float (CVSSv3 0.0-10.0), threat_vector: str, profile: HVP_Profile | None,
+        forensic: ForensicContext, calendar_invite: dict | None
+Output: MatchResult(final_score CVSSv3 0.0-10.0, severity_weight, targeted_asset_hit: bool,
+        escalate: bool, channels: list[str], osint_signal: Signal | None,
+        force_sandbox: bool)
+```
+
+##### Core Code Snippet
+
+```python
+# hvp/matcher.py
+from __future__ import annotations
+
+import hashlib
+from dataclasses import dataclass
+
+SUPPLY_CHAIN_BOOST = 1.2
+VECTOR_BOOST = 2.0  # CVSSv3 points (was 20 percentage points on 0-100 scale)
+CVSS_MAX = 10.0
+
+
+def severity_from_score(score: float) -> str:
+    """CVSSv3 severity mapping: 0.0-3.9 low, 4.0-6.9 medium, 7.0-8.9 high, 9.0-10.0 critical."""
+    if score >= 9.0:
+        return "critical"
+    if score >= 7.0:
+        return "high"
+    if score >= 4.0:
+        return "medium"
+    return "low"
+
+
+@dataclass
+class MatchResult:
+    final_score: float
+    severity_weight: str
+    targeted_asset_hit: bool
+    escalate: bool
+    channels: list[str]
+    force_sandbox: bool = False
+
+
+UNKNOWN_HIGH_RISK_PROFILE = object()  # sentinel — no multiplier, floor 7.0
+UNKNOWN_HIGH_RISK_SCORE_FLOOR = 7.0   # CVSSv3 high (Zero Trust, Req 10.9)
+
+
+def resolve_role(forensic_email: str | None, file_path: str,
+                 profiles: list) -> object | None:
+    """Resolve HVP profile. Returns matched profile or None (→ UNKNOWN_HIGH_RISK).
+
+    Zero Trust: None here means HIGH RISK, never low risk (Ambiguitas 4, Req 10.9).
+    """
+    for profile in profiles:
+        if forensic_email and any(p in forensic_email
+                                  for p in profile.email_patterns):
+            return profile
+        if any(p in file_path for p in profile.path_patterns):
+            return profile
+    return None  # caller MUST treat None as UNKNOWN_HIGH_RISK
+
+
+def apply_matcher(base_score: float, threat_vector: str, profile,
+                  monitored_hit: bool, supply_chain_hit: bool = False) -> MatchResult:
+    """All scores CVSSv3 0.0-10.0. Escalation at >= 9.0 triggers containment (Req 7)."""
+    final = base_score * profile.priority_multiplier
+    if threat_vector in profile.threat_vectors:
+        final = min(final + VECTOR_BOOST, CVSS_MAX)
+    if profile.role == "LEAD_DEV_DEVOPS" and supply_chain_hit:
+        # ponytail: bobot statis; ganti model ML bila data supply-chain cukup
+        final = min(final * SUPPLY_CHAIN_BOOST, CVSS_MAX)
+    final = round(min(final, CVSS_MAX), 1)
+    return MatchResult(
+        final_score=final,
+        severity_weight=severity_from_score(final),
+        targeted_asset_hit=monitored_hit,
+        escalate=final >= profile.auto_escalation_threshold,  # >= 9.0 enforced by Policy
+        channels=list(profile.escalation_channels),
+        force_sandbox=profile.role == "HRD_RECRUITMENT",
+    )
+
+
+def email_sha256(email: str) -> str:
+    """Email author hanya disimpan sebagai hash (Req 10.11)."""
+    return hashlib.sha256(email.encode("utf-8")).hexdigest()
+```
+
+OSINT calendar (`check_invite_domains()` → Signal medium bila domain tak terpercaya + muda/typosquat, Req 10.12) ikut modul ini saat implementasi.
 
 ---
 
-### Part 8: HashDB and Policy Configuration
+### Part 4b: DETACHED METADATA INDEXING (Zero-Knowledge Path Privacy)
 
-> _Placeholder — to be specified in the next part._
+#### Modules: `sdk/path_index.py`, local SDK agent (`sdk/local_agent.py`)
+
+#### Objective
+
+Keep the Control Plane blind to the developer's directory tree while keeping the
+dashboard readable. The SDK transmits only `SHA-256(absolute_path)` for identity
+mapping plus a `RelativeMaskedPath` (`[root]/<repo-relative-path>`) for display.
+The absolute-path → hash map lives in a machine-local SQLite index owned by a
+stateful local SDK agent; inverse resolution (hash → physical path) executes only
+on the developer machine. A stolen server DB yields hashes, not paths.
+
+**Validates: Requirements 15.2, 15.8, 15.9, 16.1**
+
+#### Logic Flow
+
+```
+watchdog event (absolute path, SDK worker memory only)
+    ↓
+[path_index.register(absolute_path)]
+    file_path_hash = SHA-256(abs)
+    relative_masked_path = "[root]/" + repo_relative(abs)   # strip machine prefix
+    local SQLite upsert {file_path_hash → absolute_path}    # NEVER uploaded
+    ↓
+SubmissionPayload → Control Plane carries ONLY hash + masked path
+    ↓
+dashboard shows "[root]/src/auth.py" (from masked path, never absolute)
+    ↓ drill-down / patch-apply needed
+local SDK agent resolves hash → absolute path IN-PROCESS (loopback only)
+```
+
+Repo-root anchoring: `repo_relative()` resolves against the enclosing git top-level
+(`git rev-parse --show-toplevel`); non-git trees fall back to the configured
+`watch_path`. Paths escaping the anchor are rejected (`..` traversal → `ValueError`).
+
+#### Input/Output Schema (Pydantic / JSON)
+
+```python
+# sdk/path_index.py — wire + local models
+from __future__ import annotations
+
+import hashlib
+import sqlite3
+from pathlib import Path
+
+from pydantic import BaseModel, Field
+
+
+class PathIdentity(BaseModel):
+    """Identity material attached to every SubmissionPayload (Req 15.2)."""
+    file_path_hash: str = Field(pattern=r"^[0-9a-f]{64}$")  # SHA-256 hex
+    relative_masked_path: str = Field(pattern=r"^\[root\]/\S+$")  # e.g. [root]/src/auth.py
+
+
+class LocalPathRecord(BaseModel):
+    """Machine-local index row. NEVER serialized to the wire (Req 15.8)."""
+    file_path_hash: str
+    absolute_path: str  # local disk only
+
+
+def derive_identity(absolute_path: str, anchor: str) -> PathIdentity:
+    """Hash + masked display path. Raises ValueError on anchor escape."""
+    rel = Path(absolute_path).resolve().relative_to(Path(anchor).resolve())
+    if ".." in rel.parts:
+        raise ValueError("path escapes anchor")
+    return PathIdentity(
+        file_path_hash=hashlib.sha256(absolute_path.encode("utf-8")).hexdigest(),
+        relative_masked_path="[root]/" + rel.as_posix(),
+    )
+
+
+class LocalPathIndex:
+    """Stateful machine-local agent store: hash → absolute path."""
+
+    def __init__(self, db_path: str = ".pantheon/paths.db") -> None:
+        self._db = sqlite3.connect(db_path)
+        self._db.execute(
+            "CREATE TABLE IF NOT EXISTS paths"
+            " (file_path_hash TEXT PRIMARY KEY, absolute_path TEXT NOT NULL)"
+        )
+
+    def register(self, absolute_path: str, anchor: str) -> PathIdentity:
+        identity = derive_identity(absolute_path, anchor)
+        self._db.execute(
+            "INSERT OR REPLACE INTO paths VALUES (?, ?)",
+            (identity.file_path_hash, absolute_path),
+        )
+        self._db.commit()
+        return identity
+
+    def resolve_local(self, file_path_hash: str) -> str | None:
+        """Inverse resolution — loopback/local-process only (Req 15.9)."""
+        row = self._db.execute(
+            "SELECT absolute_path FROM paths WHERE file_path_hash = ?",
+            (file_path_hash,),
+        ).fetchone()
+        return row[0] if row else None
+```
+
+```json
+// SubmissionPayload.path_identity — the ONLY path material on the wire
+{
+  "file_path_hash": "9f2c…a41d",
+  "relative_masked_path": "[root]/src/auth.py"
+}
+```
+
+#### Server-Blindness Contract
+
+- `SubmissionPayload`, `ForensicContext`, `EventLogEntry`, `ThreatReport`, WebSocket
+  payloads: **hash + masked path only** — an absolute path string in any of these is a
+  spec violation (caught by Property 21).
+- `ForensicContext` gains `relative_masked_path: str`; its former raw `file_path`
+  field is removed (Req 16.1 amended). HVP path-pattern matching (Req 10.10) and
+  GPG-gated identity (Part 4) operate on the masked relative form.
+- `POST /api/v1/scan {file_path}` (manual scan, § API Design) accepts a
+  `relative_masked_path` or hash only — absolute paths rejected with 422.
+- Dashboard drill-down / patch-apply calls the developer machine's local agent;
+  the Control Plane proxies an opaque `resolve_request{file_path_hash}` and relays
+  back only the operator-confirmed action, never the path.
+
+#### Correctness Property (new)
+
+**Property 24: Pipeline Worker stores never contain an absolute path.**
+_For any_ `SubmissionPayload`, `EventLogEntry`, or WebSocket broadcast examined
+server-side, no field matches an absolute-path pattern (`^[A-Za-z]:\\`, `^/`,
+`^\\\\`); identity is carried by `file_path_hash` and display by
+`relative_masked_path` only.
+
+**Validates: Requirements 15.2, 15.8, 15.9**
+
+---
+
+### Part 5: Multi-Agent Outputs & Event Bus
+
+Consolidated (Step 4): Part 5 absorbs all post-analysis output specs — decision routing,
+server worker pool, JSONL SIEM writer, EventBus dispatch, WebSocketManager routing,
+and dashboard alert contract. The former Part 7 (EventLog, EventBus, WebSocket
+Pipeline) is folded here; no standalone Part 7 remains.
+
+#### Modules: `pipeline/` (CrewAI Pipeline), `inspector/decision.py`, `control_plane/workers.py`, `control_plane/eventlog.py`, `control_plane/ws/`
+
+---
+
+#### `pipeline/` — CrewAI Workers (async, rate-limited)
+
+##### Objective
+
+Run Parser → Scanner → RedTeamer → Auditor sequentially per job, off the asyncio event loop, under layered LLM-cost guards (pre-filter → Sentry Gateway triage → concurrency semaphore → token bucket → per-call timeouts) so a single client cannot burn the Gemini free-tier quota (anti Denial-of-Wallet).
+
+Terminology contract (Ambiguitas 3 resolved): entry-point triage is the pure-Python
+**Sentry Gateway** (not an agent, no LLM calls); heavy async backend work is the
+**CrewAI Pipeline** of exactly 4 agents. The names `SentryAgent` and
+`TrafficCodeAnalyzer` are retired and SHALL NOT appear in code or new docs.
+
+#### `gateway/sentry.py` — Sentry Gateway (pure-Python triage)
+
+##### Objective
+
+Single entry-point triage on the FastAPI server. Validates, deduplicates, and
+fast-triages each job before it may enter the expensive CrewAI Pipeline. Pure Python,
+no LLM calls, no agent framework — deterministic and cheap.
+
+**Validates: Requirements 16.8**
+
+##### Logic Flow
+
+```
+Pipeline Worker dequeues job {job_id, chunk, submitted_at, client_id}
+    ↓
+[Sentry Gateway — pure Python]
+    validate SubmissionPayload schema → 422-style reject + EventLog
+    dedupe: file_path_hash + evidence_hash seen? → drop duplicate + EventLog
+    fast triage heuristics (no LLM): Layer-3 match_reason severity hint,
+        evidence_hash blocklist, client rate flags
+    ↓ clean → log triage result, release job, NO CrewAI invocation
+    ↓ suspicious → forward to CrewAI Pipeline (run_in_executor)
+```
+
+##### Input/Output Schema
+
+```
+Input:  job dict {job_id, chunk: SubmissionPayload, submitted_at, client_id}
+Output: TriageVerdict(clean | suspicious, reason: str)
+Side effects (clean): EventLog triage entry, job released, zero LLM tokens spent
+Side effects (suspicious): job handed to CrewAI Pipeline via run_in_executor
+```
+
+##### Core Code Snippet
+
+```python
+# gateway/sentry.py — pure Python, no LLM, no agent framework
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Literal
+
+
+@dataclass
+class TriageVerdict:
+    disposition: Literal["clean", "suspicious"]
+    reason: str
+
+
+class SentryGateway:
+    """Entry-point triage. Deterministic; safe to run on the event loop."""
+
+    def __init__(self, blocklist: set[str] | None = None) -> None:
+        self._seen: set[tuple[str, str]] = set()  # (file_path_hash, evidence_hash)
+        self._blocklist = blocklist or set()
+
+    def triage(self, job: dict) -> TriageVerdict:
+        chunk = job["chunk"]
+        key = (chunk.file_path_hash, chunk.evidence_hash)
+        if key in self._seen:
+            return TriageVerdict("clean", "duplicate_of_processed_job")
+        self._seen.add(key)
+        if chunk.evidence_hash in self._blocklist:
+            return TriageVerdict("suspicious", "evidence_blocklist_hit")
+        if chunk.match_reason in ("exec", "crypto", "auth"):
+            return TriageVerdict("suspicious", f"critical_match:{chunk.match_reason}")
+        return TriageVerdict("clean", "no_triage_signal")
+```
+
+#### CrewAI Pipeline — 4 agents, sequential, no exceptions
+
+Parser Agent → Scanner Agent → RedTeamer Agent → Auditor Agent. Exactly these four
+names, exactly this order (`AGENT_CHAIN`). Any future agent joins only via a spec
+amendment; ad-hoc additions (e.g. a fifth "triage agent") are a spec violation
+caught by Property 3.
+
+**Validates: Requirements 2.1–2.7, 16.8–16.10**
+
+##### Logic Flow
+
+```
+SERVER_SCAN_QUEUE job {job_id, chunk, submitted_at, client_id}
+    ↓
+Pipeline Worker (Semaphore(3) caps concurrent pipelines)
+    ↓
+Sentry Gateway triage → clean? → log + release, zero LLM tokens
+    ↓ suspicious
+TokenBucket.acquire() — 14 RPM shared (Gemini free tier)
+    ↓
+run_in_executor → crew.kickoff() — sync CrewAI, 30s hard timeout
+    Parser → Scanner → RedTeamer → Auditor (sequential, async_execution=True)
+    ↓ any agent raises → fail-closed: severity "high" + EventLog(agent_id, reason), chain stops
+    ↓
+ThreatReport → decision.route() → post_audit_hook()
+```
+
+Cost-guard layers, outermost first: L0–L3 pre-filter (Part 1) → Sentry Gateway triage skip (Req 16.8, suspicious-only deep analysis) → `Semaphore(3)` → token bucket 14 RPM → per-call timeouts (Gemini 15s, Joern 20s, sandbox 10s) → HTTP 429 backoff 60s + front re-queue.
+
+##### Input/Output Schema
+
+```
+Input:  job dict {job_id: str, chunk: SubmissionPayload, submitted_at: str, client_id: str}
+Output: ThreatReport {severity, matched_patterns, remediation_summary, patch_diff?,
+        signals, agent_chain=["Parser","Scanner","RedTeamer","Auditor"],
+        pipeline_duration_ms, patch_source}
+Raises: never to caller — every failure path returns fail-closed ThreatReport(severity="high")
+```
+
+##### Core Code Snippet
+
+```python
+# pipeline/crew.py
+from __future__ import annotations
+
+import asyncio
+import time
+
+from crewai import Agent, Crew, Process, Task
+
+from shared.models import ThreatReport
+
+PIPELINE_TIMEOUT_S = 30
+AGENT_CHAIN = ["Parser", "Scanner", "RedTeamer", "Auditor"]
+
+
+def build_crew(payload: dict, tools: dict) -> Crew:
+    """Four agents, strictly sequential. Each task feeds the next."""
+    parser = Agent(role="Parser", goal="Normalize payload and detect language",
+                   backstory="...", tools=[tools["parse"]], async_execution=True)
+    scanner = Agent(role="Scanner", goal="SAST + CPG/GNN anomaly scan",
+                    backstory="...", tools=[tools["semgrep"], tools["cpg_gnn"]],
+                    async_execution=True)
+    red = Agent(role="RedTeamer", goal="RAG intel + sandbox DAST on suspicious payloads",
+                backstory="...", tools=[tools["rag"], tools["sandbox"]],
+                async_execution=True)
+    auditor = Agent(role="Auditor", goal="Consolidate findings into ThreatReport",
+                    backstory="...", async_execution=True)
+    tasks = [
+        Task(description="parse", agent=parser, expected_output="ParsedArtifact"),
+        Task(description="scan", agent=scanner, expected_output="ScanResult"),
+        Task(description="redteam", agent=red, expected_output="RedTeamFindings"),
+        Task(description="audit", agent=auditor, expected_output="ThreatReport"),
+    ]
+    return Crew(agents=[parser, scanner, red, auditor], tasks=tasks,
+                process=Process.sequential)
+
+
+def run_pipeline_sync(job: dict, tools: dict) -> ThreatReport:
+    """Sync entry point — always called inside run_in_executor, never on the loop."""
+    started = time.monotonic()
+    try:
+        crew = build_crew(job["chunk"], tools)
+        # CrewAI kickoff is blocking; caller wraps this fn in wait_for(30s).
+        result = crew.kickoff()
+        return ThreatReport.from_crew_result(result, duration_ms=_elapsed_ms(started))
+    except Exception as exc:  # fail-closed (Req 2.6): no partial chain is trusted
+        return ThreatReport.fail_closed(reason=repr(exc), duration_ms=_elapsed_ms(started))
+```
+
+```python
+# pipeline/static_scanner.py
+from __future__ import annotations
+
+import subprocess
+
+from shared.models import Signal
+
+JOERN_TIMEOUT_S = 20
+
+
+def semgrep_scan(artifact: dict, rule_sets: list[str]) -> list[Signal]:
+    """Pattern SAST. Non-zero exit → inconclusive, pipeline continues (Req 3.5)."""
+    proc = subprocess.run(["semgrep", "--json", "--config", *rule_sets, artifact["path"]],
+                          capture_output=True, text=True, timeout=60)
+    if proc.returncode != 0:
+        return [Signal(severity="unknown", pattern_id="semgrep_error",
+                       source="semgrep", confidence=0.0,
+                       description="inconclusive: semgrep exit != 0")]
+    return [Signal(severity=m["severity"], pattern_id=m["rule_id"], source="semgrep",
+                   confidence=1.0, description=m["message"])
+            for m in parse_semgrep_json(proc.stdout)]
+
+
+def cpg_gnn_scan(artifact: dict, gnn: object, threshold: float) -> list[Signal]:
+    """Data-flow anomaly via Joern CPG + GNN. Timeout → Semgrep-only (Req 4.5)."""
+    if artifact["language"] not in ("python", "javascript", "typescript", "java"):
+        return []
+    try:
+        cpg = subprocess.run(["joern", "--script", "cpg.sc", artifact["path"]],
+                             capture_output=True, text=True, timeout=JOERN_TIMEOUT_S)
+        score: float = gnn.infer(cpg.stdout)  # pre-trained model, loaded at startup
+    except subprocess.TimeoutExpired:
+        return []  # caller logs timeout to EventLog
+    if score > threshold:
+        return [Signal(severity="high", pattern_id="gnn_anomaly", source="gnn",
+                       confidence=score, description=f"data-flow anomaly {score:.2f}")]
+    return []
+```
+
+```python
+# pipeline/red_teamer.py
+from __future__ import annotations
+
+import asyncio
+
+GEMINI_TIMEOUT_S = 15
+SANDBOX_TIMEOUT_S = 10
+
+
+async def rag_exploit_intel(payload_summary: str, chroma, gemini, top_k: int = 5) -> dict:
+    """ChromaDB top-K CVE/OWASP retrieval + Gemini summary (Req 6.1–6.2)."""
+    docs = chroma.query(payload_summary, n_results=top_k)  # never more than K (Prop 8)
+    try:
+        summary = await asyncio.wait_for(gemini.summarize(docs, payload_summary),
+                                         timeout=GEMINI_TIMEOUT_S)
+    except (asyncio.TimeoutError, Exception):
+        summary = None  # retrieval-only fallback, failure logged (Req 6.5)
+    return {"rag_results": docs, "gemini_summary": summary}
+
+
+async def sandbox_dast(payload: bytes, runner) -> dict:
+    """Ephemeral isolated exec; 10s hard kill, partial artifacts kept (Req 5.4)."""
+    try:
+        return await asyncio.wait_for(runner.exec_isolated(payload),
+                                      timeout=SANDBOX_TIMEOUT_S)
+    except asyncio.TimeoutError:
+        return {"timeout": True, "stdout": b"", "stderr": b"timeout after 10s"}
+```
+
+```python
+# pipeline/auditor.py
+from __future__ import annotations
+
+from shared.models import ThreatReport
+
+
+def consolidate(parsed: dict, scan_signals: list, red_findings: dict) -> ThreatReport:
+    """Single owner of the final Severity + remediation summary (Req 2.5)."""
+    severity = max_severity([s.severity for s in scan_signals] + ["low"])
+    if red_findings.get("sandbox", {}).get("malicious"):
+        severity = "critical"
+    return ThreatReport(
+        severity=severity,
+        matched_patterns=[s.pattern_id for s in scan_signals],
+        remediation_summary=build_remediation(scan_signals, red_findings),
+        signals=scan_signals,
+        agent_chain=["Parser", "Scanner", "RedTeamer", "Auditor"],
+    )
+```
+
+---
+
+#### `inspector/decision.py` — Severity Routing
+
+##### Objective
+
+Map the Auditor's final Severity to exactly one action. Critical/High act immediately without humans; Medium holds the payload and pulls a human in; Low passes.
+
+**Validates: Requirements 7.1–7.6, 11.1–11.6**
+
+##### Logic Flow
+
+```
+ThreatReport.severity
+    ├── critical / high → Policy.severity_routing[sev] (default: block)
+    │     runtime payload + block   → Gateway rejects, PolicyBlockError to Client
+    │     source payload + patch    → Gemini diff; Gemini down → template patch (flagged)
+    ├── medium → HOLD: Gateway pending queue (never forwarded) + escalation
+    │     (email / Slack / HTTP POST, 60s timeout → Policy default block|allow)
+    │     + WS summary → Red Alert popup (see amendment note below)
+    └── low → allow; EventLog only
+```
+
+> **Spec amendment note:** the Medium → WebSocket push below is now covered by
+> Requirement 14 AC#7/AC#12 (`requirements.md`, amended 2026-09-24).
+> Design Part 5 and requirements are consistent.
+
+##### Input/Output Schema
+
+```
+Input:  report: ThreatReport, job: dict (asset_type: "source_code" | "runtime_payload")
+Output: action: "block" | "patch" | "hold_escalate" | "allow"
+Side effects: Gateway reject / patch attach / pending-queue hold + escalation dispatch
+```
+
+##### Core Code Snippet
+
+```python
+# inspector/decision.py
+from __future__ import annotations
+
+
+def route(report, job: dict, policy) -> str:
+    sev = report.severity
+    if sev in ("critical", "high"):
+        action = policy.severity_routing.get(sev, "block")
+        if action == "patch" and job.get("asset_type") == "source_code":
+            report.patch_diff, report.patch_source = generate_patch(report, policy)
+        return action  # "block" | "patch" | "escalate"
+    if sev == "medium":
+        return "hold_escalate"  # Req 14 AC#7 — WS summary + Red Alert popup
+    return "allow"
+
+
+def generate_patch(report, policy) -> tuple[str | None, str | None]:
+    try:
+        return policy.gemini_client.patch(report.matched_patterns), "gemini"
+    except Exception:
+        # ponytail: template statis; ganti generator berbasis policy bila Gemini stabil
+        return render_template_patch(report.matched_patterns), "template"
+```
+
+---
+
+#### `control_plane/workers.py` — Server Worker Pool + `control_plane/eventlog.py` + `control_plane/ws/`
+
+##### Objective
+
+Drain `SERVER_SCAN_QUEUE` without ever blocking the loop: bounded concurrency, sub-50ms enqueue acknowledgement, async SIEM logging, and role-filtered real-time push so the operator dashboard red-alerts without refresh.
+
+**Validates: Requirements 14.1–14.13, 15.3–15.4, 16.5–16.10**
+
+##### Logic Flow
+
+```
+SERVER_SCAN_QUEUE (job stream per client_id)
+    ↓
+[Data Concatenation & Batching Routine] (Req 15.11 — Bulk Auto-Formatting Protection)
+    collect jobs for client_id arriving within 2.0s window
+    count > 1?
+    ├── YES: pack jobs → BatchedSubmissionPayload(chunks=[masked_payload_1, masked_payload_2, ...])
+    │        pass single batched payload array to Pipeline Worker
+    └── NO:  pass single job directly to Pipeline Worker
+    ↓
+Pipeline Worker × N (Semaphore(3) bounds concurrent CrewAI runs)
+    ↓
+run_in_executor(run_pipeline_sync, batched_or_single_job) — CrewAI stays off the loop
+    ↓ Sentry Gateway triage clean → log + skip CrewAI Pipeline
+    ↓ else → decision.route() → post_audit_hook()
+```
+
+`eventlog.py` writes the full SIEM schema defined in Data Models (EventLog Entry);
+`ws/` never receives raw paths, raw emails, or unmasked CRITICAL payloads for ADMIN
+(Req 13.3–13.4, 14.3, 14.10).
+
+##### Input/Output Schema
+
+```
+POST /api/v1/jobs → 200 {job_id, status: "queued"} | 503 {detail: "queue_full"}
+WS /ws/events?token=<SessionToken> → invalid/expired → close 4001 (Req 14.8)
+Dashboard popup (high/critical/medium): {severity, target_hvp, threats, action, final_score, ts}
+```
+
+##### Core Code Snippet
+
+```python
+# control_plane/workers.py
+from __future__ import annotations
+
+import asyncio
+
+from control_plane.eventlog import write_async as log_write
+from control_plane.ws import manager as ws_manager
+from inspector.decision import route
+from pipeline.crew import PIPELINE_TIMEOUT_S, run_pipeline_sync
+
+PIPELINE_SEMAPHORE = asyncio.Semaphore(3)  # max 3 concurrent CrewAI runs (Req 16.9)
+BATCH_WINDOW_S = 2.0  # 2-second collection window for bulk modifications (Req 15.11)
+
+
+async def collect_batch(queue: asyncio.Queue, initial_job: dict, window_s: float = BATCH_WINDOW_S) -> list[dict]:
+    """Batch jobs arriving for the same client_id within window_s."""
+    batch = [initial_job]
+    client_id = initial_job.get("client_id")
+    end_time = asyncio.get_event_loop().time() + window_s
+    while True:
+        remaining = end_time - asyncio.get_event_loop().time()
+        if remaining <= 0:
+            break
+        try:
+            next_job = await asyncio.wait_for(queue.get(), timeout=remaining)
+            if next_job.get("client_id") == client_id:
+                batch.append(next_job)
+            else:
+                # Different client_id -> re-queue for other workers
+                await queue.put(next_job)
+                break
+        except asyncio.TimeoutError:
+            break
+    return batch
+
+
+async def pipeline_worker(queue: asyncio.Queue, ctx: dict) -> None:
+    """Drain SERVER_SCAN_QUEUE with batching; never blocks the event loop."""
+    loop = asyncio.get_event_loop()
+    while True:
+        first_job = await queue.get()
+        try:
+            batch = await collect_batch(queue, first_job)
+            job_payload = batch[0] if len(batch) == 1 else {
+                "job_id": batch[0]["job_id"],
+                "batch_mode": True,
+                "client_id": batch[0]["client_id"],
+                "chunks": [j["chunk"] for j in batch],
+                "submitted_at": batch[0]["submitted_at"],
+            }
+            async with PIPELINE_SEMAPHORE:
+                await ctx["token_bucket"].acquire()  # 14 RPM shared
+                report = await asyncio.wait_for(
+                    loop.run_in_executor(None, run_pipeline_sync, job_payload, ctx["tools"]),
+                    timeout=PIPELINE_TIMEOUT_S + 5,
+                )
+                action = route(report, job_payload, ctx["policy"])
+                await post_audit_hook(report, job_payload, action, ctx)
+        finally:
+            queue.task_done()
+
+
+async def post_audit_hook(report, job: dict, action: str, ctx: dict) -> None:
+    entry = build_event_log_entry(report, job, action)  # full SIEM schema, § Data Models
+    await log_write(entry)                       # aiofiles, non-blocking (Req 14.12)
+    await ctx["event_bus"].put(entry)            # put_nowait; dispatch task broadcasts
+    # dispatch task (EventBus loop) calls:
+    #   await ws_manager.broadcast(entry, action)  # role-filtered per table above
+```
+
+```python
+# control_plane/eventlog.py
+from __future__ import annotations
+
+import json
+
+import aiofiles
+
+LOG_PATH = "logs/pantheon.jsonl"
+
+
+async def write_async(entry: dict) -> None:
+    """Append one SIEM event as a single line. Never blocks the loop."""
+    line = json.dumps(entry, separators=(",", ":"), ensure_ascii=False)
+    async with aiofiles.open(LOG_PATH, "a", encoding="utf-8") as f:
+        await f.write(line + "\n")
+```
+
+```python
+# control_plane/ws/routing.py
+from __future__ import annotations
+
+
+def ws_targets(entry: dict) -> set[str]:
+    """Role-filtered broadcast targets. ADMIN never gets CEO high/critical (Req 14.6)."""
+    sev, hvp = entry["severity_level"], entry["target_hvp"]
+    if sev in ("high", "critical"):
+        return {"SUPER_ADMIN"} if hvp == "CEO" else {"ADMIN", "SUPER_ADMIN"}
+    if sev == "medium":
+        # Req 14 AC#7/AC#12 — Red Alert popup for medium (summary payload only)
+        return {"SUPER_ADMIN"} if hvp == "CEO" else {"ADMIN", "SUPER_ADMIN"}
+    return set()  # low → EventLog only
+```
+
+## Appendix A: Consolidated Module Index (Step 4 — final architecture)
+
+| Part | Modules | Covers |
+| ---- | ------- | ------ |
+| 1 | `sdk/background.py`, `sdk/pre_filter.py` | Watchdog events, L0–L3 filters, ScanQueue, HashDB gate |
+| 2 | `sdk/forensics.py`, `shared/models.py`, `shared/policy.py` | ForensicExtractor, canonical dataclasses, Policy |
+| 3 | `sdk/transport.py`, `control_plane/api/jobs.py`, `control_plane/rbac.py` | Ingestion, SessionToken, RBAC, masking enforcement |
+| 4 | `hvp/identity.py`, `hvp/matcher.py` | GPG verify + grace period, threat multiplier, OSINT |
+| 4b | `sdk/path_index.py`, `sdk/local_agent.py` | Detached Metadata Indexing, Zero-Knowledge paths |
+| 5 | `gateway/sentry.py`, `pipeline/`, `inspector/decision.py`, `control_plane/workers.py`, `control_plane/eventlog.py`, `control_plane/ws/` | Triage, 4-agent pipeline, routing, SIEM writer, EventBus, WebSocket |
+| — | `## Security Design`, `## Data Models`, `## API Design` | RBAC matrix, masking rules, canonical schemas (normative, not duplicated per-Part) |
+
+Retired placeholders: Part 6 (folded into Part 3), Part 7 (folded into Part 5),
+Part 8 (HashDB → Part 1, Policy → Part 2; no standalone Part 8 remains).
